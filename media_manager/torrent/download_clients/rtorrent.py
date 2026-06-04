@@ -57,22 +57,24 @@ class RtorrentDownloadClient(AbstractDownloadClient):
         download_dir = (
             MediaManagerConfig().misc.torrent_directory / indexer_result.title
         )
-        # The empty first argument is the load target. The download directory and
-        # ruTorrent label (d.custom1) are applied as part of the load command.
-        commands = (
-            f'd.directory.set="{download_dir}"',
-            f'd.custom1.set="{self.config.label}"',
-        )
         try:
-            self._load(indexer_result, commands)
+            # Load the torrent stopped, then configure and start it. The download
+            # directory and label are passed as proper XML-RPC arguments (not
+            # embedded in load command strings) so that values coming from the
+            # indexer (e.g. the title) cannot break out or inject commands.
+            self._load(indexer_result)
+            # rTorrent registers the download asynchronously.
+            self._wait_until_registered(torrent_hash)
+
+            target_hash = torrent_hash.upper()
+            self._engine.rpc.d.directory.set(target_hash, str(download_dir))
+            self._engine.rpc.d.custom1.set(target_hash, self.config.label)
+            self._engine.rpc.d.start(target_hash)
+
             log.info(f"Successfully added torrent to rTorrent: {indexer_result.title}")
         except Exception:
             log.exception("Failed to add torrent to rTorrent")
             raise
-
-        # rTorrent registers the download asynchronously; wait so that the caller
-        # can immediately query or pause it by info-hash.
-        self._wait_until_registered(torrent_hash)
 
         torrent = Torrent(
             status=TorrentStatus.unknown,
@@ -87,18 +89,19 @@ class RtorrentDownloadClient(AbstractDownloadClient):
 
         return torrent
 
-    def _load(self, indexer_result: IndexerQueryResult, commands: tuple[str, ...]) -> None:
+    def _load(self, indexer_result: IndexerQueryResult) -> None:
         """
-        Load a torrent into rTorrent.
+        Load a torrent into rTorrent in a stopped state.
 
         Unlike qBittorrent/Transmission, rTorrent cannot follow an HTTP redirect
         to a magnet link, so the download URL is resolved here (mirroring
         get_torrent_hash): magnet links are loaded as-is, .torrent files are
-        downloaded and pushed as raw data so the download registers immediately.
+        downloaded and pushed as raw data. Loading stopped lets the caller set
+        the download directory before the download starts.
         """
         download_url = str(indexer_result.download_url)
         if download_url.startswith("magnet:"):
-            self._engine.rpc.load.start("", download_url, *commands)
+            self._engine.rpc.load.normal("", download_url)
             return
 
         try:
@@ -111,15 +114,17 @@ class RtorrentDownloadClient(AbstractDownloadClient):
                 session=requests.Session(),
                 timeout=MediaManagerConfig().indexers.prowlarr.timeout_seconds,
             )
-            self._engine.rpc.load.start("", magnet, *commands)
+            self._engine.rpc.load.normal("", magnet)
             return
 
-        self._engine.rpc.load.raw_start(
-            "", xmlrpc.client.Binary(response.content), *commands
-        )
+        self._engine.rpc.load.raw("", xmlrpc.client.Binary(response.content))
 
     def _wait_until_registered(self, torrent_hash: str) -> None:
-        """Wait until rTorrent has registered the download for the given hash."""
+        """
+        Wait until rTorrent has registered the download for the given hash.
+
+        :raises RuntimeError: If the download does not register before the timeout.
+        """
         target_hash = torrent_hash.upper()
         deadline = time.monotonic() + _REGISTRATION_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
@@ -129,10 +134,11 @@ class RtorrentDownloadClient(AbstractDownloadClient):
             except Exception:
                 log.debug("Failed to fetch download list while waiting", exc_info=True)
             time.sleep(_REGISTRATION_POLL_SECONDS)
-        log.warning(
+        msg = (
             f"Torrent {target_hash} did not register in rTorrent within "
             f"{_REGISTRATION_TIMEOUT_SECONDS}s"
         )
+        raise RuntimeError(msg)
 
     def remove_torrent(self, torrent: Torrent, delete_data: bool = False) -> None:
         """
